@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"reflect"
 	"testing"
 	"time"
 
@@ -282,6 +283,117 @@ func TestQueryInstantCodec_EncodeRequest(t *testing.T) {
 				testutil.Equals(t, tc.checkFunc(r), true)
 			}
 		})
+	}
+}
+
+func TestLimitMergeResponse(t *testing.T) {
+	codec := NewThanosQueryInstantCodec(false)
+
+	for _, tc := range []struct {
+		name         string
+		req          []*queryrange.PrometheusRequest
+		resps        []queryrange.Response
+		expectedResp queryrange.Response
+		expectedErr  error
+	}{
+		{
+			name: "limit",
+			req: []*queryrange.PrometheusRequest{
+				{
+					Query: "limitk(2, up) by (job)",
+				},
+				{
+					Query: "limit_ratio(0.2, up) by (job)",
+				},
+			},
+			resps: []queryrange.Response{
+				&queryrange.PrometheusInstantQueryResponse{
+					Status: queryrange.StatusSuccess,
+					Data: queryrange.PrometheusInstantQueryData{
+						ResultType: model.ValVector.String(),
+						Result: queryrange.PrometheusInstantQueryResult{
+							Result: &queryrange.PrometheusInstantQueryResult_Vector{
+								Vector: &queryrange.Vector{
+									Samples: []*queryrange.Sample{
+										{
+											Timestamp:   0,
+											SampleValue: 1,
+											Labels: cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{
+												"__name__": "up",
+												"job":      "foo",
+											})),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				&queryrange.PrometheusInstantQueryResponse{
+					Status: queryrange.StatusSuccess,
+					Data: queryrange.PrometheusInstantQueryData{
+						ResultType: model.ValVector.String(),
+						Result: queryrange.PrometheusInstantQueryResult{
+							Result: &queryrange.PrometheusInstantQueryResult_Vector{
+								Vector: &queryrange.Vector{
+									Samples: []*queryrange.Sample{
+										{
+											Timestamp:   0,
+											SampleValue: 2,
+											Labels: cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{
+												"__name__": "up",
+												"job":      "bar",
+											})),
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedResp: &queryrange.PrometheusInstantQueryResponse{
+				Status: queryrange.StatusSuccess,
+				Data: queryrange.PrometheusInstantQueryData{
+					ResultType: model.ValVector.String(),
+					Analysis:   &queryrange.Analysis{},
+					Result: queryrange.PrometheusInstantQueryResult{
+						Result: &queryrange.PrometheusInstantQueryResult_Vector{
+							Vector: &queryrange.Vector{
+								Samples: []*queryrange.Sample{
+									{
+										Timestamp:   0,
+										SampleValue: 1,
+										Labels: cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{
+											"__name__": "up",
+											"job":      "foo",
+										})),
+									},
+									{
+										Timestamp:   0,
+										SampleValue: 2,
+										Labels: cortexpb.FromLabelsToLabelAdapters(labels.FromMap(map[string]string{
+											"__name__": "up",
+											"job":      "bar",
+										})),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	} {
+		for i, req := range tc.req {
+			resp, err := codec.MergeResponse(req, tc.resps...)
+			if err != tc.expectedErr {
+				t.Errorf("Test case %d: expected err %v, got %v", i, tc.expectedErr, err)
+			}
+			if !reflect.DeepEqual(resp, tc.expectedResp) {
+				t.Errorf("Test case %d: expected resp %v, got %v", i, tc.expectedResp, resp)
+			}
+		}
 	}
 }
 
