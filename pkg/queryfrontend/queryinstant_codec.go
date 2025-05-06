@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -330,6 +331,7 @@ func vectorMerge(req queryrange.Request, resps []*queryrange.PrometheusInstantQu
 	}
 
 	if sortPlan == mergeOnly {
+		fmt.Println("mergeOnly :", metrics)
 		for _, k := range metrics {
 			result.Samples = append(result.Samples, output[k])
 		}
@@ -347,6 +349,8 @@ func vectorMerge(req queryrange.Request, resps []*queryrange.PrometheusInstantQu
 			metric: k,
 			s:      v,
 		})
+		fmt.Println("metric ", k)
+		fmt.Println("s ", v)
 	}
 
 	sort.Slice(samples, func(i, j int) bool {
@@ -380,9 +384,9 @@ func sortPlanForQuery(q string) (sortPlan, error) {
 	if err != nil {
 		return 0, err
 	}
-	// Check if the root expression is topk or bottomk
+	// Check if the root expression is topk, bottomk, limitk or limit_ratio
 	if aggr, ok := expr.(*parser.AggregateExpr); ok {
-		if aggr.Op == parser.TOPK || aggr.Op == parser.BOTTOMK {
+		if aggr.Op == parser.TOPK || aggr.Op == parser.BOTTOMK || aggr.Op == parser.LIMITK || aggr.Op == parser.LIMIT_RATIO {
 			return mergeOnly, nil
 		}
 	}

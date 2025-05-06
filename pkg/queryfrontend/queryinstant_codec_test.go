@@ -14,6 +14,7 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/efficientgo/core/testutil"
@@ -288,6 +289,10 @@ func TestQueryInstantCodec_EncodeRequest(t *testing.T) {
 
 func TestLimitMergeResponse(t *testing.T) {
 	codec := NewThanosQueryInstantCodec(false)
+	parser.EnableExperimentalFunctions = true
+	t.Cleanup(func() {
+		parser.EnableExperimentalFunctions = false
+	})
 
 	for _, tc := range []struct {
 		name         string
