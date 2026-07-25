@@ -5,9 +5,11 @@ package queryrange
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -18,7 +20,6 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
-	"github.com/gogo/protobuf/types"
 	otlog "github.com/opentracing/opentracing-go/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -35,6 +36,25 @@ import (
 	"github.com/thanos-io/thanos/internal/cortex/util/spanlogger"
 	"github.com/thanos-io/thanos/internal/cortex/util/validation"
 )
+
+// Extent is a time-bounded fragment of a cached query response.
+// Body is the Response encoded as Prometheus/Thanos API JSON (not protobuf Any).
+// See https://github.com/thanos-io/thanos/issues/8643.
+type Extent struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+	// Type is proto.MessageName of the concrete Response. Empty means PrometheusResponse.
+	Type string `json:"type,omitempty"`
+	// Body is JSON for the response without headers.
+	// stdjson.RawMessage so the package-level jsoniter `json` API embeds it as JSON, not base64.
+	Body stdjson.RawMessage `json:"body"`
+}
+
+// CachedResponse is the JSON envelope stored in the results cache backend.
+type CachedResponse struct {
+	Key     string   `json:"key"`
+	Extents []Extent `json:"extents"`
+}
 
 var (
 	// Value that cacheControlHeader has if the response indicates that the results should not be cached.
@@ -96,8 +116,12 @@ func (PrometheusResponseExtractor) Extract(start, end int64, from Response) Resp
 }
 
 // ExtractForStep extracts response data for a range and step.
+// The result does not retain any encoded JSON body (content is mutated).
 func (PrometheusResponseExtractor) ExtractForStep(start, end, step int64, from Response) Response {
-	promRes := from.(*PrometheusResponse)
+	promRes := asPrometheusResponse(from)
+	if promRes == nil {
+		return from
+	}
 	return &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
@@ -120,9 +144,13 @@ const (
 
 // ResponseWithoutHeaders is useful in caching data without headers since
 // we anyways do not need headers for sending back the response so this saves some space by reducing size of the objects.
+// Encoded JSON is preserved: headers are not part of the Prometheus JSON body.
 func (PrometheusResponseExtractor) ResponseWithoutHeaders(resp Response) Response {
-	promRes := resp.(*PrometheusResponse)
-	return &PrometheusResponse{
+	promRes := asPrometheusResponse(resp)
+	if promRes == nil {
+		return resp
+	}
+	out := &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
 			ResultType: promRes.Data.ResultType,
@@ -132,11 +160,23 @@ func (PrometheusResponseExtractor) ResponseWithoutHeaders(resp Response) Respons
 		},
 		Warnings: promRes.Warnings,
 	}
+	if body := encodedJSON(resp); len(body) > 0 {
+		return withEncodedJSON(out, body)
+	}
+	return out
 }
 
-// ResponseWithoutStats is returns the response without the stats information
+// ResponseWithoutStats returns the response without the stats information.
+// If stats were present, any encoded JSON body is dropped (payload changed).
+// If there were no stats, the encoded body is preserved.
 func (PrometheusResponseExtractor) ResponseWithoutStats(resp Response) Response {
-	promRes := resp.(*PrometheusResponse)
+	promRes := asPrometheusResponse(resp)
+	if promRes == nil {
+		return resp
+	}
+	if promRes.Data.Stats == nil {
+		return resp
+	}
 	return &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
@@ -590,15 +630,11 @@ type accumulator struct {
 }
 
 func merge(extents []Extent, acc *accumulator) ([]Extent, error) {
-	any, err := types.MarshalAny(acc.Response)
+	ext, err := responseToExtent(acc.Extent.Start, acc.Extent.End, acc.Response)
 	if err != nil {
 		return nil, err
 	}
-	return append(extents, Extent{
-		Start:    acc.Extent.Start,
-		End:      acc.Extent.End,
-		Response: any,
-	}), nil
+	return append(extents, ext), nil
 }
 
 func newAccumulator(base Extent) (*accumulator, error) {
@@ -612,16 +648,42 @@ func newAccumulator(base Extent) (*accumulator, error) {
 	}, nil
 }
 
-func toExtent(ctx context.Context, req Request, res Response) (Extent, error) {
-	any, err := types.MarshalAny(res)
-	if err != nil {
-		return Extent{}, err
+func toExtent(_ context.Context, req Request, res Response) (Extent, error) {
+	return responseToExtent(req.GetStart(), req.GetEnd(), res)
+}
+
+func responseToExtent(start, end int64, res Response) (Extent, error) {
+	// Prefer original wire/cache JSON to avoid re-marshaling sample data.
+	body := encodedJSON(res)
+	if len(body) == 0 {
+		var err error
+		// Marshal the structured payload. Unwrap encodedBodyResponse so we don't
+		// encode the wrapper; avoid typed-nil Response from asPrometheusResponse.
+		if prom := asPrometheusResponse(res); prom != nil {
+			body, err = json.Marshal(prom)
+		} else {
+			body, err = json.Marshal(res)
+		}
+		if err != nil {
+			return Extent{}, err
+		}
 	}
 	return Extent{
-		Start:    req.GetStart(),
-		End:      req.GetEnd(),
-		Response: any,
+		Start: start,
+		End:   end,
+		Type:  responseTypeName(res),
+		Body:  body,
 	}, nil
+}
+
+func responseTypeName(res Response) string {
+	if prom := asPrometheusResponse(res); prom != nil {
+		return proto.MessageName(prom)
+	}
+	if pm, ok := res.(proto.Message); ok {
+		return proto.MessageName(pm)
+	}
+	return ""
 }
 
 // partition calculates the required requests to satisfy req given the cached data.
@@ -633,7 +695,7 @@ func (s resultsCache) partition(req Request, extents []Extent, stepExtraction st
 
 	for _, extent := range extents {
 		// If there is no overlap, ignore this extent.
-		if extent.GetEnd() < start || extent.Start > req.GetEnd() {
+		if extent.End < start || extent.Start > req.GetEnd() {
 			continue
 		}
 
@@ -656,8 +718,14 @@ func (s resultsCache) partition(req Request, extents []Extent, stepExtraction st
 		if err != nil {
 			return nil, nil, err
 		}
-		// extract the overlap from the cached extent.
-		cachedResponses = append(cachedResponses, s.extract(req, start, req.GetEnd(), res, stepExtraction))
+		// When the whole extent is consumed without step thinning, keep the
+		// cached JSON body for passthrough encode (thanos#8643).
+		if stepExtraction == extractAnyStep && start <= extent.Start && req.GetEnd() >= extent.End {
+			cachedResponses = append(cachedResponses, res)
+		} else {
+			// extract the overlap from the cached extent (drops encoded body).
+			cachedResponses = append(cachedResponses, s.extract(req, start, req.GetEnd(), res, stepExtraction))
+		}
 		start = extent.End
 	}
 
@@ -694,11 +762,11 @@ func (s resultsCache) filterRecentExtents(req Request, maxCacheFreshness time.Du
 				return nil, err
 			}
 			extracted := s.extractor.Extract(extents[i].Start, maxCacheTime, res)
-			any, err := types.MarshalAny(extracted)
+			ext, err := responseToExtent(extents[i].Start, maxCacheTime, extracted)
 			if err != nil {
 				return nil, err
 			}
-			extents[i].Response = any
+			extents[i] = ext
 		}
 	}
 	return extents, nil
@@ -754,13 +822,13 @@ func (s resultsCache) getFirst(ctx context.Context, keys []string) ([]Extent, st
 
 func (s resultsCache) decodeCachedResponse(ctx context.Context, key string, buf []byte) ([]Extent, bool) {
 	var resp CachedResponse
-	log, ctx := spanlogger.New(ctx, "unmarshal-extent") //nolint:ineffassign,staticcheck
+	log, _ := spanlogger.New(ctx, "unmarshal-extent")
 	defer log.Finish()
 
 	log.LogFields(otlog.Int("bytes", len(buf)))
 
-	if err := proto.Unmarshal(buf, &resp); err != nil {
-		level.Error(log).Log("msg", "error unmarshalling cached value", "err", err)
+	if err := json.Unmarshal(buf, &resp); err != nil {
+		level.Debug(log).Log("msg", "error unmarshalling cached value as JSON", "err", err)
 		log.Error(err)
 		return nil, false
 	}
@@ -769,9 +837,9 @@ func (s resultsCache) decodeCachedResponse(ctx context.Context, key string, buf 
 		return nil, false
 	}
 
-	// Refreshes the cache if it contains an old proto schema.
+	// Reject incomplete entries (empty body means the extent is unusable).
 	for _, e := range resp.Extents {
-		if e.Response == nil {
+		if len(e.Body) == 0 {
 			return nil, false
 		}
 	}
@@ -780,7 +848,7 @@ func (s resultsCache) decodeCachedResponse(ctx context.Context, key string, buf 
 }
 
 func (s resultsCache) put(ctx context.Context, key string, extents []Extent) {
-	buf, err := proto.Marshal(&CachedResponse{
+	buf, err := json.Marshal(CachedResponse{
 		Key:     key,
 		Extents: extents,
 	})
@@ -857,18 +925,32 @@ func isTimestampAtStep(start, end, step, ts int64) bool {
 }
 
 func (e *Extent) toResponse() (Response, error) {
-	msg, err := types.EmptyAny(e.Response)
-	if err != nil {
-		return nil, err
+	if len(e.Body) == 0 {
+		return nil, fmt.Errorf("empty cached extent body")
 	}
 
-	if err := types.UnmarshalAny(e.Response, msg); err != nil {
-		return nil, err
+	// Default / common case: Prometheus range response.
+	if e.Type == "" || e.Type == proto.MessageName(&PrometheusResponse{}) {
+		var resp PrometheusResponse
+		if err := json.Unmarshal(e.Body, &resp); err != nil {
+			return nil, err
+		}
+		// Retain cache JSON for full-hit passthrough encode / re-store.
+		return withEncodedJSON(&resp, e.Body), nil
 	}
 
+	// Other Response implementations (e.g. labels/series) registered with gogo/protobuf.
+	mt := proto.MessageType(e.Type)
+	if mt == nil {
+		return nil, fmt.Errorf("unknown cached response type %q", e.Type)
+	}
+	msg := reflect.New(mt.Elem()).Interface()
+	if err := json.Unmarshal(e.Body, msg); err != nil {
+		return nil, err
+	}
 	resp, ok := msg.(Response)
 	if !ok {
-		return nil, fmt.Errorf("bad cached type")
+		return nil, fmt.Errorf("cached type %q is not a Response", e.Type)
 	}
 	return resp, nil
 }

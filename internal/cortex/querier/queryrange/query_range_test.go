@@ -121,7 +121,8 @@ func TestResponse(t *testing.T) {
 			}
 			resp, err := PrometheusCodec.DecodeResponse(context.Background(), response, nil)
 			require.NoError(t, err)
-			assert.Equal(t, tc.expected, resp)
+			assert.Equal(t, tc.expected, asPrometheusResponse(resp))
+			assert.Equal(t, []byte(tc.body), encodedJSON(resp))
 
 			// Reset response, as the above call will have consumed the body reader.
 			response = &http.Response{
@@ -132,7 +133,12 @@ func TestResponse(t *testing.T) {
 			}
 			resp2, err := PrometheusCodec.EncodeResponse(context.Background(), resp)
 			require.NoError(t, err)
-			assert.Equal(t, response, resp2)
+			// Headers may differ slightly; body must be the retained wire JSON.
+			gotBody, err := io.ReadAll(resp2.Body)
+			require.NoError(t, err)
+			assert.Equal(t, []byte(tc.body), gotBody)
+			assert.Equal(t, response.StatusCode, resp2.StatusCode)
+			assert.Equal(t, response.ContentLength, resp2.ContentLength)
 		})
 	}
 }
@@ -214,7 +220,8 @@ func TestResponseWithStats(t *testing.T) {
 			}
 			resp, err := PrometheusCodec.DecodeResponse(context.Background(), response, nil)
 			require.NoError(t, err)
-			assert.Equal(t, tc.expected, resp)
+			assert.Equal(t, tc.expected, asPrometheusResponse(resp))
+			assert.Equal(t, []byte(tc.body), encodedJSON(resp))
 
 			// Reset response, as the above call will have consumed the body reader.
 			response = &http.Response{
@@ -225,7 +232,10 @@ func TestResponseWithStats(t *testing.T) {
 			}
 			resp2, err := PrometheusCodec.EncodeResponse(context.Background(), resp)
 			require.NoError(t, err)
-			assert.Equal(t, prettyPrintJsonBody(t, response.Body), prettyPrintJsonBody(t, resp2.Body))
+			// Passthrough must return the exact decoded body bytes.
+			gotBody, err := io.ReadAll(resp2.Body)
+			require.NoError(t, err)
+			assert.Equal(t, []byte(tc.body), gotBody)
 		})
 	}
 }

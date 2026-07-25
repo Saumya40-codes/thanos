@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/gogo/protobuf/types"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +26,21 @@ const (
 	responseBody          = `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"foo":"bar"},"values":[[1536673680,"137"],[1536673780,"137"]]}],"analysis":null},"warnings":["test-warn"]}`
 	histogramResponseBody = `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"fake":"histogram"},"histograms":[[1536673680,{"count":"5","sum":"18.4","buckets":[[3,"-0.001","0.001","2"],[0,"0.7071067811865475","1","1"],[0,"1","1.414213562373095","2"],[0,"2","2.82842712474619","1"],[0,"2.82842712474619","4","1"]]}]]}],"analysis":null}}`
 )
+
+// requireEqualResponse compares structured Prometheus payloads, ignoring
+// encoded-body wrappers used for cache/HTTP passthrough.
+func requireEqualResponse(t *testing.T, expected, actual Response, msgAndArgs ...interface{}) {
+	t.Helper()
+	require.Equal(t, asPrometheusResponse(expected), asPrometheusResponse(actual), msgAndArgs...)
+}
+
+func requireEqualResponses(t *testing.T, expected, actual []Response, msgAndArgs ...interface{}) {
+	t.Helper()
+	require.Equal(t, len(expected), len(actual), msgAndArgs...)
+	for i := range expected {
+		requireEqualResponse(t, expected[i], actual[i], msgAndArgs...)
+	}
+}
 
 var (
 	parsedRequest = &PrometheusRequest{
@@ -173,15 +187,11 @@ func mkExtentWithStep(start, end, step int64) Extent {
 
 func mkExtentWithStepWithStats(start, end, step int64, withStats bool) Extent {
 	res := mkAPIResponseWithStats(start, end, step, withStats)
-	any, err := types.MarshalAny(res)
+	ext, err := responseToExtent(start, end, res)
 	if err != nil {
 		panic(err)
 	}
-	return Extent{
-		Start:    start,
-		End:      end,
-		Response: any,
-	}
+	return ext
 }
 
 func TestStatsCacheQuerySamples(t *testing.T) {
@@ -841,7 +851,7 @@ func TestPartition(t *testing.T) {
 			reqs, resps, err := s.partition(tc.input, tc.prevCachedResponse, extractAnyStep)
 			require.Nil(t, err)
 			require.Equal(t, tc.expectedRequests, reqs)
-			require.Equal(t, tc.expectedCachedResponse, resps)
+			requireEqualResponses(t, tc.expectedCachedResponse, resps)
 		})
 	}
 }
@@ -1021,9 +1031,9 @@ func TestHandleHit(t *testing.T) {
 					End:   80,
 
 					// if the optimization of "sorting by End when Start of 2 Extents are equal" is not there, this nil
-					// response would cause error during Extents merge phase. With the optimization
+					// body would cause error during Extents merge phase. With the optimization
 					// this bad Extent should be dropped. The good Extent below can be used instead.
-					Response: nil,
+					Body: nil,
 				},
 				mkExtentWithStep(60, 160, 20),
 			},
@@ -1048,7 +1058,7 @@ func TestHandleHit(t *testing.T) {
 			require.NoError(t, err)
 
 			expectedResponse := mkAPIResponse(tc.input.GetStart(), tc.input.GetEnd(), tc.input.GetStep())
-			require.Equal(t, expectedResponse, response, "response does not match the expectation")
+			requireEqualResponse(t, expectedResponse, response, "response does not match the expectation")
 			require.Equal(t, tc.expectedUpdatedCachedEntry, updatedExtents, "updated cache entry does not match the expectation")
 		})
 	}
@@ -1140,13 +1150,13 @@ func TestResultsCache(t *testing.T) {
 	resp, err := rc.Do(ctx, parsedRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, &useResp, resp)
+	requireEqualResponse(t, &useResp, resp)
 
 	// Doing same request again shouldn't change anything.
 	resp, err = rc.Do(ctx, parsedRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, &useResp, resp)
+	requireEqualResponse(t, &useResp, resp)
 
 	// Doing request with new end time should do one more query.
 	req := parsedRequest.WithStartEnd(parsedRequest.GetStart(), parsedRequest.GetEnd()+100)
@@ -1379,15 +1389,15 @@ func Test_resultsCache_MissingData(t *testing.T) {
 
 	// fill up the cache
 	rc.put(ctx, "empty", []Extent{{
-		Start:    100,
-		End:      200,
-		Response: nil,
+		Start: 100,
+		End:   200,
+		Body:  nil,
 	}})
 	rc.put(ctx, "notempty", []Extent{mkExtent(100, 120)})
 	rc.put(ctx, "mixed", []Extent{mkExtent(100, 120), {
-		Start:    120,
-		End:      200,
-		Response: nil,
+		Start: 120,
+		End:   200,
+		Body:  nil,
 	}})
 
 	extents, hit := rc.get(ctx, "empty")
@@ -1408,9 +1418,9 @@ func TestResultsCacheGetFirstSkipsInvalidEntries(t *testing.T) {
 	ctx := context.Background()
 
 	rc.put(ctx, "empty", []Extent{{
-		Start:    100,
-		End:      200,
-		Response: nil,
+		Start: 100,
+		End:   200,
+		Body:  nil,
 	}})
 	rc.put(ctx, "notempty", []Extent{mkExtent(100, 120)})
 
@@ -1557,13 +1567,13 @@ func TestNativeHistograms(t *testing.T) {
 	resp, err := rc.Do(ctx, parsedHistogramRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, &useResp, resp)
+	requireEqualResponse(t, &useResp, resp)
 
 	// Doing same request again shouldn't change anything.
 	resp, err = rc.Do(ctx, parsedHistogramRequest)
 	require.NoError(t, err)
 	require.Equal(t, 1, calls)
-	require.Equal(t, &useResp, resp)
+	requireEqualResponse(t, &useResp, resp)
 
 	// Doing request with new end time should do one more query.
 	req := parsedHistogramRequest.WithStartEnd(parsedHistogramRequest.GetStart(), parsedHistogramRequest.GetEnd()+100)

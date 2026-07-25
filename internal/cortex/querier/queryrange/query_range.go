@@ -248,13 +248,23 @@ func (prometheusCodec) MergeResponse(_ Request, responses ...Response) (Response
 	if len(responses) == 0 {
 		return NewEmptyPrometheusResponse(), nil
 	}
+	// Identity merge only when we can pass through retained JSON. Otherwise a
+	// single response is still normalized through the merge path below
+	// (status/analysis/stats shaping).
+	if len(responses) == 1 && len(encodedJSON(responses[0])) > 0 {
+		return responses[0], nil
+	}
 
 	promResponses := make([]*PrometheusResponse, 0, len(responses))
 	// we need to pass on all the headers for results cache gen numbers.
 	var resultsCacheGenNumberHeaderValues []string
 
 	for _, res := range responses {
-		promResponses = append(promResponses, res.(*PrometheusResponse))
+		promRes := asPrometheusResponse(res)
+		if promRes == nil {
+			return nil, httpgrpc.Errorf(http.StatusInternalServerError, "invalid response format")
+		}
+		promResponses = append(promResponses, promRes)
 		resultsCacheGenNumberHeaderValues = append(resultsCacheGenNumberHeaderValues, getHeaderValuesWithName(res, ResultsCacheGenNumberHeaderName)...)
 	}
 
@@ -410,7 +420,9 @@ func (prometheusCodec) DecodeResponse(ctx context.Context, r *http.Response, _ R
 	for h, hv := range r.Header {
 		resp.Headers = append(resp.Headers, &PrometheusResponseHeader{Name: h, Values: hv})
 	}
-	return &resp, nil
+	// Retain original wire JSON so results-cache can store it and EncodeResponse
+	// can pass it through without re-marshaling (thanos#8643).
+	return withEncodedJSON(&resp, buf), nil
 }
 
 // Buffer can be used to read a response body.
@@ -440,16 +452,21 @@ func (prometheusCodec) EncodeResponse(ctx context.Context, res Response) (*http.
 	sp, _ := opentracing.StartSpanFromContext(ctx, "APIResponse.ToHTTPResponse")
 	defer sp.Finish()
 
-	a, ok := res.(*PrometheusResponse)
-	if !ok {
+	a := asPrometheusResponse(res)
+	if a == nil {
 		return nil, httpgrpc.Errorf(http.StatusInternalServerError, "invalid response format")
 	}
 
 	sp.LogFields(otlog.Int("series", len(a.Data.Result)))
 
-	b, err := json.Marshal(a)
-	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusInternalServerError, "error encoding response: %v", err)
+	// Prefer retained wire/cache JSON when the structured payload was not mutated.
+	b := encodedJSON(res)
+	if len(b) == 0 {
+		var err error
+		b, err = json.Marshal(a)
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusInternalServerError, "error encoding response: %v", err)
+		}
 	}
 
 	sp.LogFields(otlog.Int("bytes", len(b)))

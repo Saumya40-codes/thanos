@@ -79,8 +79,8 @@ func Test_statsMiddleware_AddsHeaderWithStats(t *testing.T) {
 				require.Equal(t, fakeHandler.request.GetStats(), "all")
 			}
 
-			promResp, ok := resp.(*PrometheusResponse)
-			require.True(t, ok)
+			promResp := asPrometheusResponse(resp)
+			require.NotNil(t, promResp)
 
 			assert.Equal(t, qryStats.LoadPeakSamples(), tt.peakSamples)
 			assert.Equal(t, qryStats.LoadTotalSamples(), tt.totalSamples)
