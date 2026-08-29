@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
+	toolkit_web "github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/storage"
@@ -50,6 +51,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/api"
 	statusapi "github.com/thanos-io/thanos/pkg/api/status"
 	"github.com/thanos-io/thanos/pkg/logging"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/receive/writecapnp"
 
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -118,6 +120,7 @@ type Options struct {
 	ReceiverMode            ReceiverMode
 	Tracer                  opentracing.Tracer
 	TLSConfig               *tls.Config
+	WebConfigFile           string
 	DialOpts                []grpc.DialOption
 	ForwardTimeout          time.Duration
 	MaxBackoff              time.Duration
@@ -482,6 +485,9 @@ func (h *Handler) Close() {
 // Run serves the HTTP endpoints.
 func (h *Handler) Run() error {
 	level.Info(h.logger).Log("msg", "Start listening for connections", "address", h.options.ListenAddress)
+	if err := toolkit_web.Validate(h.options.WebConfigFile); err != nil {
+		return errors.Wrap(err, "validate remote write web config")
+	}
 
 	listener, err := net.Listen("tcp", h.options.ListenAddress)
 	if err != nil {
@@ -492,6 +498,11 @@ func (h *Handler) Run() error {
 	listener = conntrack.NewListener(listener,
 		conntrack.TrackWithName("http"),
 		conntrack.TrackWithTracing())
+
+	if h.options.WebConfigFile != "" {
+		flags := &toolkit_web.FlagConfig{WebConfigFile: &h.options.WebConfigFile}
+		return toolkit_web.Serve(listener, h.httpSrv, flags, logutil.GoKitLogToSlog(h.logger))
+	}
 
 	if h.options.TLSConfig != nil {
 		level.Info(h.logger).Log("msg", "Serving HTTPS", "address", h.options.ListenAddress)

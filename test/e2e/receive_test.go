@@ -63,6 +63,41 @@ func ErrorHandler(_ http.ResponseWriter, _ *http.Request, err error) {
 func TestReceive(t *testing.T) {
 	t.Parallel()
 
+	t.Run("remote_write_basic_auth", func(t *testing.T) {
+		t.Parallel()
+		e, err := e2e.NewDockerEnvironment("recv-auth")
+		testutil.Ok(t, err)
+		t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+		webConfig := `
+basic_auth_users:
+  test: $2y$10$IsC9GG9U61sPCuDwwwcnPuMRyzx62cIcdNRs4SIdKwgWihfX4IC.C
+`
+		receiver := e2ethanos.NewReceiveBuilder(e, "receive").
+			WithIngestionEnabled().
+			WithWebConfig(webConfig).
+			Init()
+		testutil.Ok(t, e2e.StartAndWaitReady(receiver))
+
+		for _, path := range []string{"/api/v1/receive", "/api/v1/otlp"} {
+			req, err := http.NewRequest(http.MethodPost, "http://"+receiver.Endpoint("remote-write")+path, nil)
+			testutil.Ok(t, err)
+
+			resp, err := http.DefaultClient.Do(req)
+			testutil.Ok(t, err)
+			testutil.Equals(t, http.StatusUnauthorized, resp.StatusCode)
+			testutil.Ok(t, resp.Body.Close())
+		}
+
+		req, err := http.NewRequest(http.MethodPost, "http://"+receiver.Endpoint("remote-write")+"/api/v1/receive", nil)
+		testutil.Ok(t, err)
+		req.SetBasicAuth("test", "test")
+		resp, err := http.DefaultClient.Do(req)
+		testutil.Ok(t, err)
+		testutil.Equals(t, http.StatusBadRequest, resp.StatusCode)
+		testutil.Ok(t, resp.Body.Close())
+	})
+
 	t.Run("single_ingestor", func(t *testing.T) {
 		/*
 			The single_ingestor suite represents the simplest possible configuration of Thanos Receive.

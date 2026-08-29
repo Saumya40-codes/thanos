@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	gotls "crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -154,9 +155,17 @@ func runReceive(
 		}
 	}
 
-	rwTLSConfig, err := tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), conf.rwServerCert, conf.rwServerKey, conf.rwServerClientCA, conf.rwServerTlsMinVersion, conf.rwServerTlsCiphers, conf.rwServerTlsCurves)
-	if err != nil {
-		return err
+	var rwTLSConfig *gotls.Config
+	if *conf.httpTLSConfig != "" {
+		if conf.rwServerCert != "" || conf.rwServerKey != "" || conf.rwServerClientCA != "" || len(conf.rwServerTlsCiphers) > 0 || len(conf.rwServerTlsCurves) > 0 {
+			level.Warn(logger).Log("msg", "ignoring --remote-write.server-tls-* flags because --http.config is set")
+		}
+	} else {
+		var err error
+		rwTLSConfig, err = tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), conf.rwServerCert, conf.rwServerKey, conf.rwServerClientCA, conf.rwServerTlsMinVersion, conf.rwServerTlsCiphers, conf.rwServerTlsCurves)
+		if err != nil {
+			return err
+		}
 	}
 
 	dialOpts, err := extgrpc.StoreClientGRPCOpts(
@@ -286,6 +295,7 @@ func runReceive(
 		ReceiverMode:         receiveMode,
 		Tracer:               tracer,
 		TLSConfig:            rwTLSConfig,
+		WebConfigFile:        *conf.httpTLSConfig,
 		SplitTenantLabelName: conf.splitTenantLabelName,
 		DialOpts:             dialOpts,
 		ForwardTimeout:       time.Duration(*conf.forwardTimeout),

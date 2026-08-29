@@ -617,6 +617,7 @@ type ReceiveBuilder struct {
 	labels                []string
 	tenantSplitLabel      string
 	objStoreConfig        *client.BucketConfig
+	webConfig             string
 }
 
 func NewReceiveBuilder(e e2e.Environment, name string) *ReceiveBuilder {
@@ -700,6 +701,11 @@ func (r *ReceiveBuilder) WithNativeHistograms() *ReceiveBuilder {
 
 func (r *ReceiveBuilder) WithObjStoreConfig(config client.BucketConfig) *ReceiveBuilder {
 	r.objStoreConfig = &config
+	return r
+}
+
+func (r *ReceiveBuilder) WithWebConfig(config string) *ReceiveBuilder {
+	r.webConfig = config
 	return r
 }
 
@@ -807,6 +813,16 @@ func (r *ReceiveBuilder) Init() *e2eobs.Observable {
 		args["--receive.relabel-config"] = string(relabelConfigBytes)
 	}
 
+	probe := e2e.NewHTTPReadinessProbe("http", "/-/ready", 200, 200)
+	if r.webConfig != "" {
+		if err := os.WriteFile(filepath.Join(r.Dir(), "web-config.yml"), []byte(r.webConfig), 0600); err != nil {
+			return &e2eobs.Observable{Runnable: e2e.NewFailedRunnable(r.Name(), errors.Wrap(err, "creating web config"))}
+		}
+		args["--http.config"] = filepath.Join(r.InternalDir(), "web-config.yml")
+		// If auth is enabled then prober would get 401 error.
+		probe = e2e.NewHTTPReadinessProbe("http", "/-/ready", 401, 401)
+	}
+
 	if r.nativeHistograms {
 		args["--tsdb.enable-native-histograms"] = ""
 	}
@@ -822,7 +838,7 @@ func (r *ReceiveBuilder) Init() *e2eobs.Observable {
 	return e2eobs.AsObservable(r.f.Init(wrapWithDefaults(e2e.StartOptions{
 		Image:     r.image,
 		Command:   e2e.NewCommand("receive", e2e.BuildKingpinArgs(args)...),
-		Readiness: e2e.NewHTTPReadinessProbe("http", "/-/ready", 200, 200),
+		Readiness: probe,
 	})), "http")
 }
 
